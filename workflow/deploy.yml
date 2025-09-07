@@ -1,0 +1,111 @@
+name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "ECR image digest (sha256:...) to deploy"
+        required: false
+  workflow_run:
+    workflows: ["build"]
+    types: [ "completed" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: canary_rollout/podinfo
+  LAMBDA_ALIAS_DEV: dev
+  LAMBDA_ALIAS_PROD: prod
+
+jobs:
+  plan-artifact:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.set.outputs.image_digest }}
+    steps:
+      - name: Determine image digest
+        id: set
+        run: |
+          if [ -n "${{ github.event.inputs.image_digest }}" ]; then
+            echo "image_digest=${{ github.event.inputs.image_digest }}" >> $GITHUB_OUTPUT
+          else
+            echo "image_digest=${{{{ github.event.workflow_run.head_sha }}}}" >> $GITHUB_OUTPUT  # placeholder if not provided
+          fi
+
+  deploy-dev:
+    needs: plan-artifact
+    environment: dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify cosign signature (policy gate)
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.2.4'
+      - run: |
+          ECR_URI=$(aws ecr describe-repositories --repository-names $ECR_REPOSITORY --query 'repositories[0].repositoryUri' --output text)
+          cosign verify $ECR_URI@${{ needs.plan-artifact.outputs.image_digest }}
+
+      - name: Deploy Lambda (dev) via CodeDeploy canary 10% -> 100%
+        run: |
+          ./scripts/deploy_lambda.sh dev "${{ needs.plan-artifact.outputs.image_digest }}"
+
+      - name: Deploy EC2/ALB (dev) via CodeDeploy blue/green
+        run: |
+          ./scripts/deploy_ec2.sh dev "${{ needs.plan-artifact.outputs.image_digest }}"
+
+      - name: Smoke tests (dev)
+        run: |
+          ./scripts/smoke_test.sh dev
+
+  approve-prod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://example.com  # this field indicates this prod env URL placeholder
+    steps:
+      - name: Await manual approval
+        run: echo "Approved to promote to prod"
+
+  deploy-prod:
+    needs: approve-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify cosign signature (policy gate)
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.2.4'
+      - run: |
+          ECR_URI=$(aws ecr describe-repositories --repository-names $ECR_REPOSITORY --query 'repositories[0].repositoryUri' --output text)
+          cosign verify $ECR_URI@${{ needs.plan-artifact.outputs.image_digest }}
+
+      - name: Deploy Lambda (prod) via CodeDeploy canary
+        run: |
+          ./scripts/deploy_lambda.sh prod "${{ needs.plan-artifact.outputs.image_digest }}"
+
+      - name: Deploy EC2/ALB (prod) via CodeDeploy blue/green
+        run: |
+          ./scripts/deploy_ec2.sh prod "${{ needs.plan-artifact.outputs.image_digest }}"
+
+      - name: Smoke tests (prod)
+        run: |
+          ./scripts/smoke_test.sh prod

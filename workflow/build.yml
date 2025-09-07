@@ -1,0 +1,90 @@
+name: build
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # needed for OIDC to AWS
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: canary_rollout/podinfo
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:build-${{ github.sha }} -f app/Dockerfile .
+
+      - name: Tag with ECR uri
+        run: |
+          ECR_URI=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          docker tag ${{ env.ECR_REPOSITORY }}:build-${{ github.sha }} $ECR_URI:build-${{ github.sha }}
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+
+      - name: Push
+        run: |
+          docker push $ECR_URI:build-${{ github.sha }}
+
+      - name: Export digest
+        id: digest
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_URI:build-${{ github.sha }} | awk -F'@' '{print $2}')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=$ECR_URI@${DIGEST}" >> $GITHUB_ENV
+
+      - name: Install Syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0.17.6
+
+      - name: Generate SBOM
+        run: |
+          syft packages $ECR_URI@${{ steps.digest.outputs.digest }} -o spdx-json > sbom.spdx.json
+          echo "SBOM generated"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.2.4'
+
+      - name: Cosign keyless sign
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes $ECR_URI@${{ steps.digest.outputs.digest }}
+          cosign verify $ECR_URI@${{ steps.digest.outputs.digest }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Set outputs
+        id: out
+        run: |
+          echo "image_uri=$ECR_URI@${{ steps.digest.outputs.digest }}" >> $GITHUB_OUTPUT
+          echo "digest=${{ steps.digest.outputs.digest }}" >> $GITHUB_OUTPUT
